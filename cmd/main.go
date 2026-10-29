@@ -21,7 +21,7 @@ import (
 	"os"
 
 	"github.com/alecthomas/kingpin/v2"
-	configpkg "github.com/prometheus-community/json_exporter/config"
+	"github.com/prometheus-community/json_exporter/config"
 	"github.com/prometheus-community/json_exporter/exporter"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -56,12 +56,12 @@ func Run() {
 	logger.Info("Build context", "build", version.BuildContext())
 
 	logger.Info("Loading config file", "file", *configFile)
-	config, err := configpkg.LoadConfig(*configFile)
+	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
 		logger.Error("Error loading config", "err", err)
 		os.Exit(1)
 	}
-	configJSON, err := json.Marshal(config)
+	configJSON, err := json.Marshal(cfg)
 	if err != nil {
 		logger.Error("Failed to marshal config to JSON", "err", err)
 	}
@@ -73,7 +73,7 @@ func Run() {
 
 	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/probe", func(w http.ResponseWriter, req *http.Request) {
-		probeHandler(w, req, logger, config)
+		probeHandler(w, req, logger, cfg)
 	})
 	if *metricsPath != "/" && *metricsPath != "" {
 		landingConfig := web.LandingConfig{
@@ -102,13 +102,13 @@ func Run() {
 	}
 }
 
-func probeHandler(w http.ResponseWriter, r *http.Request, logger *slog.Logger, config configpkg.Config) {
+func probeHandler(w http.ResponseWriter, r *http.Request, logger *slog.Logger, cfg config.Config) {
 
 	module := r.URL.Query().Get("module")
 	if module == "" {
 		module = "default"
 	}
-	if _, ok := config.Modules[module]; !ok {
+	if _, ok := cfg.Modules[module]; !ok {
 		http.Error(w, fmt.Sprintf("Unknown module %q", module), http.StatusBadRequest)
 		logger.Debug("Unknown module", "module", module)
 		return
@@ -119,9 +119,9 @@ func probeHandler(w http.ResponseWriter, r *http.Request, logger *slog.Logger, c
 		http.Error(w, "Target parameter is missing", http.StatusBadRequest)
 		return
 	}
-	runtime, err := exporter.NewRuntime(configpkg.RuntimeConfig{
+	runtime, err := exporter.NewRuntime(config.RuntimeConfig{
 		Target:     target,
-		Module:     config.Modules[module],
+		Module:     cfg.Modules[module],
 		Parameters: r.URL.Query(),
 	}, logger)
 	if err != nil {
