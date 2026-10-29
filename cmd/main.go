@@ -119,11 +119,10 @@ func probeHandler(w http.ResponseWriter, r *http.Request, logger *slog.Logger, c
 		http.Error(w, "Target parameter is missing", http.StatusBadRequest)
 		return
 	}
-	runtime, err := exporter.NewRuntime(config.RuntimeConfig{
-		Target:     target,
-		Module:     cfg.Modules[module],
-		Parameters: r.URL.Query(),
-	}, logger)
+	// A probe request selects exactly one target. Do not mutate the shared file
+	// configuration or inherit statically configured targets into this request.
+	cfg.Targets = []config.Target{{Address: target, Module: module, Parameters: r.URL.Query()}}
+	runtime, err := exporter.NewRuntime(cfg, logger)
 	if err != nil {
 		http.Error(w, "Invalid probe configuration: "+err.Error(), http.StatusBadRequest)
 		return

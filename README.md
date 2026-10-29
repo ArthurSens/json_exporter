@@ -109,17 +109,23 @@ $ docker run -v $PWD/examples/config.yml:/config.yml quay.io/prometheuscommunity
 ## Embedding as a Go library
 
 The `config` and `exporter` packages can collect metrics without CLI flags, a
-listening HTTP server, or registration in the default Prometheus registry:
+listening HTTP server, or registration in the default Prometheus registry.
+`config.Config` is the shared model for standalone and embedded callers:
 
 ```go
-cfg := config.NewRuntimeConfigWithDefaults()
-cfg.Target = "https://api.example.com/status"
-cfg.Module = config.Module{
-    Metrics: []config.Metric{{
-        Name: "api_queue_depth",
-        Path: "{.queue.depth}",
-        ValueType: config.ValueTypeGauge,
-    }},
+cfg := config.NewConfigWithDefaults()
+cfg.Modules = map[string]config.Module{
+    "queue": {
+        Metrics: []config.Metric{{
+            Name: "api_queue_depth",
+            Path: "{.queue.depth}",
+            ValueType: config.ValueTypeGauge,
+        }},
+    },
+}
+cfg.Targets = []config.Target{
+    {Name: "orders", Address: "https://orders.example.com/status", Module: "queue"},
+    {Name: "payments", Address: "https://payments.example.com/status", Module: "queue"},
 }
 runtime, err := exporter.NewRuntime(cfg, logger)
 if err != nil {
@@ -135,15 +141,47 @@ for _, collector := range runtime.Collectors() {
 families, err := registry.Gather()
 ```
 
-Each runtime snapshots its configuration and owns its HTTP client and lifetime
-context. Module defaults match `config.LoadConfig`; embedded callers can use
-that function to load existing modules. `Parameters` supplies POST body template
-values. Each gather fetches a fresh document with a fresh request body; the
-embedded default timeout is 30 seconds. Fetch failures become registry gather
-errors. JSONPath extraction keeps the standalone exporter's existing behavior:
-extraction errors are logged and the affected samples are omitted.
+The same configuration can be loaded with `config.LoadConfig`:
 
-`runtime.Scrape(ctx)` is also available when the caller has a per-scrape context.
-The standalone `/probe` handler uses this API and retains its request deadline
-and HTTP error handling. Shutdown cancels in-flight requests for that runtime;
-stopping one runtime does not affect another.
+```yaml
+modules:
+  queue:
+    metrics:
+      - name: api_queue_depth
+        path: '{.queue.depth}'
+        valuetype: gauge
+targets:
+  - name: orders
+    address: https://orders.example.com/status
+    module: queue
+  - name: payments
+    address: https://payments.example.com/status
+    module: queue
+timeout: 30s
+```
+
+A runtime snapshots the entire configuration and owns one collector and HTTP
+client per target, with a shared lifetime context. Registry gathers fetch all
+targets concurrently, using fresh documents and request bodies. Named targets
+add `target`, `target_name`, and `module` labels, plus their optional `labels`.
+These three label names are reserved for named targets and cannot collide with
+module metric labels. Multiple targets require unique names. A target's `module`
+defaults to `default`; its `parameters` supplies lists of strings to POST body
+templates. The runtime sets `target` and `module` template parameters itself.
+
+`NewConfigWithDefaults` and `LoadConfig` use a 30-second timeout for each HTTP
+request. Set `timeout: 0s` to leave deadlines to the caller; embedded applications
+can require a positive timeout. Configurations containing only modules remain
+valid: the standalone `/probe` handler translates each request's query parameters
+into a single unnamed target, then uses the same runtime. Unnamed targets keep
+the standalone metric format, without extra target-identification labels.
+
+Fetch failures become registry gather errors; successful target families remain
+available alongside those errors. JSONPath extraction keeps the exporter's
+existing behavior: extraction errors are logged and affected samples are omitted.
+
+`runtime.Scrape(ctx)` fetches the configured targets with a caller-supplied context
+and returns a collector of successful snapshots plus any fetch errors. The
+standalone handler uses it to retain its request cancellation and HTTP error
+handling. Shutdown cancels all in-flight requests in that runtime; stopping one
+runtime does not affect another.

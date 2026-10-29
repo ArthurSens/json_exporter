@@ -470,3 +470,24 @@ func TestBodyPostQuery(t *testing.T) {
 		target.Close()
 	}
 }
+
+func TestProbeOverridesConfiguredTargets(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"value":42}`) }))
+	defer target.Close()
+	cfg := config.Config{
+		Modules: map[string]config.Module{"default": {Metrics: []config.Metric{{Name: "probe_value", Path: "{.value}", ValueType: config.ValueTypeGauge}}}},
+		Targets: []config.Target{{Name: "configured", Address: "http://must-not-be-fetched.invalid"}},
+	}
+	req := httptest.NewRequest("GET", "http://example.com/probe?target="+target.URL, nil)
+	recorder := httptest.NewRecorder()
+	probeHandler(recorder, req, promslog.NewNopLogger(), cfg)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("probe failed: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "probe_value 42") || strings.Contains(recorder.Body.String(), "target_name") {
+		t.Fatalf("probe format changed: %s", recorder.Body.String())
+	}
+	if cfg.Targets[0].Name != "configured" {
+		t.Fatal("probe mutated shared config")
+	}
+}

@@ -15,11 +15,14 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
+	"slices"
 	"time"
 
 	pconfig "github.com/prometheus/common/config"
+	"github.com/prometheus/common/model"
 	"go.yaml.in/yaml/v2"
 )
 
@@ -51,9 +54,28 @@ const (
 	ValueTypeUntyped ValueType = "untyped"
 )
 
-// Config contains multiple modules.
+// Config contains reusable modules and optional targets for scheduled collection.
+// Modules-only configurations remain valid for the standalone /probe handler.
 type Config struct {
 	Modules map[string]Module `yaml:"modules"`
+	Targets []Target          `yaml:"targets,omitempty"`
+	Timeout time.Duration     `yaml:"timeout,omitempty"`
+}
+
+// Target selects a module and supplies its HTTP endpoint and body-template parameters.
+// Named targets attach target, target_name and module labels to every metric.
+// An unnamed single target preserves the standalone /probe metric format.
+type Target struct {
+	Name       string            `yaml:"name,omitempty"`
+	Address    string            `yaml:"address"`
+	Module     string            `yaml:"module,omitempty"`
+	Labels     map[string]string `yaml:"labels,omitempty"`
+	Parameters url.Values        `yaml:"parameters,omitempty"`
+}
+
+// NewConfigWithDefaults returns defaults shared by file-based and embedded callers.
+func NewConfigWithDefaults() Config {
+	return Config{Timeout: 30 * time.Second}
 }
 
 // Module contains metrics and headers defining a configuration
@@ -71,20 +93,33 @@ type Body struct {
 }
 
 func LoadConfig(configPath string) (Config, error) {
-	var config Config
+	cfg := NewConfigWithDefaults()
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return config, err
+		return cfg, err
 	}
 
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return config, err
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return cfg, err
 	}
 
-	for name, module := range config.Modules {
-		config.Modules[name] = module.WithDefaults()
+	return cfg.WithDefaults(), nil
+}
+
+// WithDefaults applies module defaults and resolves omitted target module names.
+// It does not replace an explicit zero timeout, which leaves deadlines to the caller.
+func (c Config) WithDefaults() Config {
+	c.Modules = maps.Clone(c.Modules)
+	for name, module := range c.Modules {
+		c.Modules[name] = module.WithDefaults()
 	}
-	return config, nil
+	c.Targets = slices.Clone(c.Targets)
+	for i := range c.Targets {
+		if c.Targets[i].Module == "" {
+			c.Targets[i].Module = "default"
+		}
+	}
+	return c
 }
 
 // WithDefaults returns a module with the same defaults used by file-based configuration.
@@ -106,43 +141,74 @@ func (m Module) WithDefaults() Module {
 	return m
 }
 
-// RuntimeConfig configures one target without depending on a CLI or HTTP handler.
-// Parameters supplies the query parameters available to POST body templates.
-type RuntimeConfig struct {
-	Target     string
-	Module     Module
-	Parameters url.Values
-	Timeout    time.Duration
-}
-
-// NewRuntimeConfigWithDefaults returns defaults for an embedded target.
-func NewRuntimeConfigWithDefaults() RuntimeConfig {
-	return RuntimeConfig{Timeout: 30 * time.Second}
-}
-
-// Validate checks configuration without contacting the target.
-// A zero timeout leaves the deadline to the caller, as in the standalone probe.
-func (c RuntimeConfig) Validate() error {
-	target, err := url.Parse(c.Target)
-	if err != nil {
-		return fmt.Errorf("parse target: %w", err)
-	}
-	if (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" {
-		return fmt.Errorf("target must be an absolute HTTP or HTTPS URL")
+// Validate checks modules and configured targets without contacting any target.
+// Targets are optional here because /probe supplies a target with each request.
+func (c Config) Validate() error {
+	c = c.WithDefaults()
+	if len(c.Modules) == 0 {
+		return fmt.Errorf("at least one module is required")
 	}
 	if c.Timeout < 0 {
 		return fmt.Errorf("timeout cannot be negative")
 	}
-	for _, metric := range c.Module.WithDefaults().Metrics {
-		if metric.Type != ValueScrape && metric.Type != ObjectScrape {
-			return fmt.Errorf("unknown metric type %q", metric.Type)
+	for name, module := range c.Modules {
+		for _, metric := range module.Metrics {
+			if metric.Type != ValueScrape && metric.Type != ObjectScrape {
+				return fmt.Errorf("module %q: unknown metric type %q", name, metric.Type)
+			}
+			switch metric.ValueType {
+			case ValueTypeGauge, ValueTypeCounter, ValueTypeUntyped:
+			default:
+				return fmt.Errorf("module %q: unknown value type %q", name, metric.ValueType)
+			}
 		}
-		switch metric.ValueType {
-		case ValueTypeGauge, ValueTypeCounter, ValueTypeUntyped:
-		default:
-			return fmt.Errorf("unknown value type %q", metric.ValueType)
+		httpConfig := module.HTTPClientConfig
+		if err := httpConfig.Validate(); err != nil {
+			return fmt.Errorf("module %q: %w", name, err)
 		}
 	}
-	httpConfig := c.Module.HTTPClientConfig
-	return httpConfig.Validate()
+	names := make(map[string]bool, len(c.Targets))
+	for i, target := range c.Targets {
+		if target.Name == "" && len(c.Targets) > 1 {
+			return fmt.Errorf("target %d: name is required when multiple targets are configured", i)
+		}
+		if names[target.Name] {
+			return fmt.Errorf("duplicate target name %q", target.Name)
+		}
+		names[target.Name] = true
+		address, err := url.Parse(target.Address)
+		if err != nil {
+			return fmt.Errorf("target %q: parse address: %w", target.Name, err)
+		}
+		if (address.Scheme != "http" && address.Scheme != "https") || address.Host == "" {
+			return fmt.Errorf("target %q: address must be an absolute HTTP or HTTPS URL", target.Name)
+		}
+		module, ok := c.Modules[target.Module]
+		if !ok {
+			return fmt.Errorf("target %q: unknown module %q", target.Name, target.Module)
+		}
+		labels := maps.Clone(target.Labels)
+		if target.Name != "" {
+			if labels == nil {
+				labels = make(map[string]string)
+			}
+			for _, key := range []string{"target", "target_name", "module"} {
+				if _, exists := labels[key]; exists {
+					return fmt.Errorf("target %q: label %q is reserved", target.Name, key)
+				}
+				labels[key] = ""
+			}
+		}
+		for key := range labels {
+			if !model.LabelName(key).IsValid() {
+				return fmt.Errorf("target %q: invalid label %q", target.Name, key)
+			}
+			for _, metric := range module.Metrics {
+				if _, exists := metric.Labels[key]; exists {
+					return fmt.Errorf("target %q: label %q collides with a metric label", target.Name, key)
+				}
+			}
+		}
+	}
+	return nil
 }
