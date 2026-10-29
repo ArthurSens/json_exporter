@@ -105,3 +105,45 @@ Then `curl "http://exporter:7979/probe?target=http://scrape_target:8080/test/dat
 ```console
 $ docker run -v $PWD/examples/config.yml:/config.yml quay.io/prometheuscommunity/json-exporter --config.file=/config.yml
 ```
+
+## Embedding as a Go library
+
+The `config` and `exporter` packages can collect metrics without CLI flags, a
+listening HTTP server, or registration in the default Prometheus registry:
+
+```go
+cfg := config.NewRuntimeConfigWithDefaults()
+cfg.Target = "https://api.example.com/status"
+cfg.Module = config.Module{
+    Metrics: []config.Metric{{
+        Name: "api_queue_depth",
+        Path: "{.queue.depth}",
+        ValueType: config.ValueTypeGauge,
+    }},
+}
+runtime, err := exporter.NewRuntime(cfg, logger)
+if err != nil {
+    return err
+}
+defer runtime.Shutdown(context.Background())
+registry := prometheus.NewRegistry()
+for _, collector := range runtime.Collectors() {
+    if err := registry.Register(collector); err != nil {
+        return err
+    }
+}
+families, err := registry.Gather()
+```
+
+Each runtime snapshots its configuration and owns its HTTP client and lifetime
+context. Module defaults match `config.LoadConfig`; embedded callers can use
+that function to load existing modules. `Parameters` supplies POST body template
+values. Each gather fetches a fresh document with a fresh request body; the
+embedded default timeout is 30 seconds. Fetch failures become registry gather
+errors. JSONPath extraction keeps the standalone exporter's existing behavior:
+extraction errors are logged and the affected samples are omitted.
+
+`runtime.Scrape(ctx)` is also available when the caller has a per-scrape context.
+The standalone `/probe` handler uses this API and retains its request deadline
+and HTTP error handling. Shutdown cancels in-flight requests for that runtime;
+stopping one runtime does not affect another.

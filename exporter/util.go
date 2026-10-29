@@ -168,15 +168,17 @@ func (f *JSONFetcher) FetchJSON(endpoint string) ([]byte, error) {
 		return nil, err
 	}
 
-	var req *http.Request
-	req, err = http.NewRequest(f.method, endpoint, f.body)
-	req = req.WithContext(f.ctx)
+	return fetchJSON(f.ctx, client, f.logger, f.module, endpoint, f.method, f.body)
+}
+
+func fetchJSON(ctx context.Context, client *http.Client, logger *slog.Logger, module config.Module, endpoint, method string, body io.Reader) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
-		f.logger.Error("Failed to create request", "err", err)
+		logger.Error("Failed to create request", "err", err)
 		return nil, err
 	}
 
-	for key, value := range f.module.Headers {
+	for key, value := range module.Headers {
 		req.Header.Add(key, value)
 	}
 	if req.Header.Get("Accept") == "" {
@@ -189,14 +191,14 @@ func (f *JSONFetcher) FetchJSON(endpoint string) ([]byte, error) {
 
 	defer func() {
 		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-			f.logger.Error("Failed to discard body", "err", err)
+			logger.Error("Failed to discard body", "err", err)
 		}
 		resp.Body.Close()
 	}()
 
-	if len(f.module.ValidStatusCodes) != 0 {
+	if len(module.ValidStatusCodes) != 0 {
 		success := false
-		for _, code := range f.module.ValidStatusCodes {
+		for _, code := range module.ValidStatusCodes {
 			if resp.StatusCode == code {
 				success = true
 				break

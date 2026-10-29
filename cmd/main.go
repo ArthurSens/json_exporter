@@ -14,7 +14,6 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -22,7 +21,7 @@ import (
 	"os"
 
 	"github.com/alecthomas/kingpin/v2"
-	"github.com/prometheus-community/json_exporter/config"
+	configpkg "github.com/prometheus-community/json_exporter/config"
 	"github.com/prometheus-community/json_exporter/exporter"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -57,7 +56,7 @@ func Run() {
 	logger.Info("Build context", "build", version.BuildContext())
 
 	logger.Info("Loading config file", "file", *configFile)
-	config, err := config.LoadConfig(*configFile)
+	config, err := configpkg.LoadConfig(*configFile)
 	if err != nil {
 		logger.Error("Error loading config", "err", err)
 		os.Exit(1)
@@ -103,11 +102,7 @@ func Run() {
 	}
 }
 
-func probeHandler(w http.ResponseWriter, r *http.Request, logger *slog.Logger, config config.Config) {
-
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	r = r.WithContext(ctx)
+func probeHandler(w http.ResponseWriter, r *http.Request, logger *slog.Logger, config configpkg.Config) {
 
 	module := r.URL.Query().Get("module")
 	if module == "" {
@@ -119,33 +114,30 @@ func probeHandler(w http.ResponseWriter, r *http.Request, logger *slog.Logger, c
 		return
 	}
 
-	registry := prometheus.NewPedanticRegistry()
-
-	metrics, err := exporter.CreateMetricsList(config.Modules[module])
-	if err != nil {
-		logger.Error("Failed to create metrics list from config", "err", err)
-	}
-
-	jsonMetricCollector := exporter.JSONMetricCollector{JSONMetrics: metrics}
-	jsonMetricCollector.Logger = logger
-
 	target := r.URL.Query().Get("target")
 	if target == "" {
 		http.Error(w, "Target parameter is missing", http.StatusBadRequest)
 		return
 	}
-
-	fetcher := exporter.NewJSONFetcher(ctx, logger, config.Modules[module], r.URL.Query())
-	data, err := fetcher.FetchJSON(target)
+	runtime, err := exporter.NewRuntime(configpkg.RuntimeConfig{
+		Target:     target,
+		Module:     config.Modules[module],
+		Parameters: r.URL.Query(),
+	}, logger)
+	if err != nil {
+		http.Error(w, "Invalid probe configuration: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer runtime.Shutdown(r.Context())
+	collector, err := runtime.Scrape(r.Context())
 	if err != nil {
 		http.Error(w, "Failed to fetch JSON response. TARGET: "+target+", ERROR: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-
-	jsonMetricCollector.Data = data
-
-	registry.MustRegister(jsonMetricCollector)
-	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
-
+	registry := prometheus.NewPedanticRegistry()
+	if err := registry.Register(collector); err != nil {
+		http.Error(w, "Failed to register JSON metrics: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	promhttp.HandlerFor(registry, promhttp.HandlerOpts{}).ServeHTTP(w, r)
 }

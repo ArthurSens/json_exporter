@@ -14,7 +14,10 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
 	"os"
+	"time"
 
 	pconfig "github.com/prometheus/common/config"
 	"go.yaml.in/yaml/v2"
@@ -78,20 +81,68 @@ func LoadConfig(configPath string) (Config, error) {
 		return config, err
 	}
 
-	// Complete Defaults
-	for _, module := range config.Modules {
-		for i := 0; i < len(module.Metrics); i++ {
-			if module.Metrics[i].Type == "" {
-				module.Metrics[i].Type = ValueScrape
-			}
-			if module.Metrics[i].Help == "" {
-				module.Metrics[i].Help = module.Metrics[i].Name
-			}
-			if module.Metrics[i].ValueType == "" {
-				module.Metrics[i].ValueType = ValueTypeUntyped
-			}
+	for name, module := range config.Modules {
+		config.Modules[name] = module.WithDefaults()
+	}
+	return config, nil
+}
+
+// WithDefaults returns a module with the same defaults used by file-based configuration.
+// The caller must finish constructing the module before handing it to a runtime.
+func (m Module) WithDefaults() Module {
+	m.Metrics = append([]Metric(nil), m.Metrics...)
+	for i := range m.Metrics {
+		metric := &m.Metrics[i]
+		if metric.Type == "" {
+			metric.Type = ValueScrape
+		}
+		if metric.Help == "" {
+			metric.Help = metric.Name
+		}
+		if metric.ValueType == "" {
+			metric.ValueType = ValueTypeUntyped
 		}
 	}
+	return m
+}
 
-	return config, nil
+// RuntimeConfig configures one target without depending on a CLI or HTTP handler.
+// Parameters supplies the query parameters available to POST body templates.
+type RuntimeConfig struct {
+	Target     string
+	Module     Module
+	Parameters url.Values
+	Timeout    time.Duration
+}
+
+// NewRuntimeConfigWithDefaults returns defaults for an embedded target.
+func NewRuntimeConfigWithDefaults() RuntimeConfig {
+	return RuntimeConfig{Timeout: 30 * time.Second}
+}
+
+// Validate checks configuration without contacting the target.
+// A zero timeout leaves the deadline to the caller, as in the standalone probe.
+func (c RuntimeConfig) Validate() error {
+	target, err := url.Parse(c.Target)
+	if err != nil {
+		return fmt.Errorf("parse target: %w", err)
+	}
+	if (target.Scheme != "http" && target.Scheme != "https") || target.Host == "" {
+		return fmt.Errorf("target must be an absolute HTTP or HTTPS URL")
+	}
+	if c.Timeout < 0 {
+		return fmt.Errorf("timeout cannot be negative")
+	}
+	for _, metric := range c.Module.WithDefaults().Metrics {
+		if metric.Type != ValueScrape && metric.Type != ObjectScrape {
+			return fmt.Errorf("unknown metric type %q", metric.Type)
+		}
+		switch metric.ValueType {
+		case ValueTypeGauge, ValueTypeCounter, ValueTypeUntyped:
+		default:
+			return fmt.Errorf("unknown value type %q", metric.ValueType)
+		}
+	}
+	httpConfig := c.Module.HTTPClientConfig
+	return httpConfig.Validate()
 }
